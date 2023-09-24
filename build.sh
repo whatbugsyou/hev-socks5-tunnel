@@ -2,14 +2,14 @@
 
 XCFRAMEWORK_DIR="./apple_xcframework"
 
-# buildStatic iphoneos -mios-version-min=15.0 arm64
+# buildStatic iphoneos -mios-version-min=12.0 arm64
 buildStatic()
 {
      echo "build for '$1', '$2', '$3'"
 
      make PP="xcrun --sdk $1 --toolchain $1 clang" \
           CC="xcrun --sdk $1 --toolchain $1 clang" \
-          CFLAGS="-arch $2 $3" \
+          CFLAGS="-arch $2 $3 -Wno-error=unused-function" \
           LFLAGS="-arch $2 $3 -Wl,-Bsymbolic-functions" static
 
      local OUTPUT_DIR="$XCFRAMEWORK_DIR/$1-$2"
@@ -42,9 +42,9 @@ rm -rf $XCFRAMEWORK_DIR
 rm -rf HevSocks5Tunnel.xcframework
 mkdir $XCFRAMEWORK_DIR
 
-buildStatic iphoneos arm64 -mios-version-min=15.0
-buildStatic iphonesimulator x86_64 -miphonesimulator-version-min=15.0
-buildStatic iphonesimulator arm64 -miphonesimulator-version-min=15.0
+buildStatic iphoneos arm64 -mios-version-min=12.0
+buildStatic iphonesimulator x86_64 -miphonesimulator-version-min=12.0
+buildStatic iphonesimulator arm64 -miphonesimulator-version-min=12.0
 mergeStatic iphonesimulator x86_64 arm64
 
 buildStatic macosx x86_64 -mmacosx-version-min=12.0
