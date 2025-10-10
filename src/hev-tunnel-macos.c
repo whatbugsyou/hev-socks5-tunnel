@@ -64,6 +64,10 @@ hev_tunnel_open (const char *name, int multi_queue)
     sc.ss_sysaddr = AF_SYS_CONTROL;
     sc.sc_unit = 0;
 
+    res = sscanf (name, "utun%u", &sc.sc_unit);
+    if (res > 0)
+        sc.sc_unit += 1;
+
     res = connect (fd, (struct sockaddr *)&sc, sizeof (sc));
     if (res < 0)
         goto exit_close;
@@ -221,6 +225,35 @@ exit:
 #else
     return 0;
 #endif
+}
+
+const char *
+hev_tunnel_get_name (void)
+{
+    return tun_name;
+}
+
+const char *
+hev_tunnel_get_index (void)
+{
+    static char tun_index[16];
+    unsigned int index;
+
+    index = if_nametoindex (tun_name);
+    snprintf (tun_index, sizeof (tun_index) - 1, "%d", index);
+    return tun_index;
+}
+
+int
+hev_tunnel_add_task (int fd, HevTask *task)
+{
+    return hev_task_add_fd (task, fd, POLLIN);
+}
+
+void
+hev_tunnel_del_task (int fd, HevTask *task)
+{
+    hev_task_del_fd (task, fd);
 }
 
 #endif /* __APPLE__ || __MACH__ */

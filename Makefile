@@ -8,17 +8,18 @@ CC=$(CROSS_PREFIX)gcc
 AR=$(CROSS_PREFIX)ar
 STRIP=$(CROSS_PREFIX)strip
 CCFLAGS=-O3 -pipe -Wall -Werror $(CFLAGS) \
+		-I$(SRCDIR) \
 		-I$(SRCDIR)/misc \
 		-I$(SRCDIR)/core/include  \
 		-I$(THIRDPARTDIR)/yaml/include \
-		-I$(THIRDPARTDIR)/lwip/include \
-		-I$(THIRDPARTDIR)/lwip/include/ports/unix \
+		-I$(THIRDPARTDIR)/wintun/include \
+		-I$(THIRDPARTDIR)/lwip/src/include \
+		-I$(THIRDPARTDIR)/lwip/src/ports/include \
 		-I$(THIRDPARTDIR)/hev-task-system/include
-LDFLAGS=$(LFLAGS) \
-		-L$(THIRDPARTDIR)/yaml/bin -lyaml \
+LDFLAGS=-L$(THIRDPARTDIR)/yaml/bin -lyaml \
 		-L$(THIRDPARTDIR)/lwip/bin -llwip \
 		-L$(THIRDPARTDIR)/hev-task-system/bin -lhev-task-system \
-		-lpthread
+		-lpthread $(LFLAGS)
 
 SRCDIR=src
 BINDIR=bin
@@ -35,7 +36,8 @@ THIRDPARTS=$(THIRDPARTDIR)/yaml \
 		   $(THIRDPARTDIR)/lwip \
 		   $(THIRDPARTDIR)/hev-task-system
 
-$(SHARED_TARGET) : CCFLAGS+=-fPIC
+$(STATIC_TARGET) : CCFLAGS+=-DENABLE_LIBRARY
+$(SHARED_TARGET) : CCFLAGS+=-DENABLE_LIBRARY -fPIC
 $(SHARED_TARGET) : LDFLAGS+=-shared -pthread
 
 -include build.mk
@@ -53,10 +55,19 @@ CLEANMSG="\e[1;34mCLEAN\e[0m %s\n"
 INSTMSG="\e[1;34mINST\e[0m  %s -> %s\n"
 UNINSMSG="\e[1;34mUNINS\e[0m %s\n"
 
+ENABLE_DEBUG :=
+ifeq ($(ENABLE_DEBUG),1)
+	CCFLAGS+=-g -O0 -DENABLE_DEBUG
+	STRIP=true
+endif
+
 ENABLE_STATIC :=
 ifeq ($(ENABLE_STATIC),1)
 	CCFLAGS+=-static
-	LDFLAGS+=-static
+endif
+
+ifeq ($(MSYSTEM),MSYS)
+	LDFLAGS+=-lmsys-2.0 -lws2_32 -lIphlpapi
 endif
 
 V :=
@@ -106,7 +117,7 @@ $(INSTDIR)/etc/$(PROJECT).yml : $(CONFIG)
 
 $(EXEC_TARGET) : $(LDOBJS) tp-static
 	$(ECHO_PREFIX) mkdir -p $(dir $@)
-	$(ECHO_PREFIX) $(CC) -o $@ $(LDOBJS) $(LDFLAGS)
+	$(ECHO_PREFIX) $(CC) $(CCFLAGS) -o $@ $(LDOBJS) $(LDFLAGS)
 	@printf $(LINKMSG) $@
 	$(ECHO_PREFIX) $(STRIP) $@
 	@printf $(STRIPMSG) $@
@@ -118,7 +129,7 @@ $(STATIC_TARGET) : $(LDOBJS) tp-static
 
 $(SHARED_TARGET) : $(LDOBJS) tp-shared
 	$(ECHO_PREFIX) mkdir -p $(dir $@)
-	$(ECHO_PREFIX) $(CC) -o $@ $(LDOBJS) $(LDFLAGS)
+	$(ECHO_PREFIX) $(CC) $(CCFLAGS) -o $@ $(LDOBJS) $(LDFLAGS)
 	@printf $(LINKMSG) $@
 
 $(BUILDDIR)/%.dep : $(SRCDIR)/%.c

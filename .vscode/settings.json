@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "*.dbclient-js": "javascript",
+        "hev-socks5-client.h": "c"
+    }
+}

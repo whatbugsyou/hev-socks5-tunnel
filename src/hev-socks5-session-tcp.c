@@ -9,8 +9,8 @@
 
 #include <errno.h>
 #include <string.h>
+
 #include <lwip/tcp.h>
-#include <netinet/in.h>
 
 #include <hev-task.h>
 #include <hev-task-io.h>
@@ -19,45 +19,67 @@
 #include <hev-memory-allocator.h>
 #include <hev-socks5-misc.h>
 
+#include "hev-utils.h"
+#include "hev-config.h"
 #include "hev-logger.h"
 #include "hev-config-const.h"
+#include "hev-socks5-tunnel.h"
 
 #include "hev-socks5-session-tcp.h"
 
-#define task_io_yielder hev_socks5_task_io_yielder
+static int
+task_io_yielder (HevTaskYieldType type, void *data)
+{
+    HevSocks5Session *self = data;
+    HevListNode *node;
+    int res;
+
+    res = hev_socks5_task_io_yielder (type, data);
+    node = hev_socks5_session_get_node (self);
+    hev_socks5_tunnel_update_session (node);
+
+    return res;
+}
 
 static int
 tcp_splice_f (HevSocks5SessionTCP *self)
 {
     struct iovec iov[64];
     struct pbuf *p;
-    ssize_t s;
-    int i;
+    int iovc = 0;
+    int res = 1;
 
-    if (!self->queue)
-        return 0;
-
-    for (p = self->queue, i = 0; p && (i < 64); p = p->next, i++) {
-        iov[i].iov_base = p->payload;
-        iov[i].iov_len = p->len;
+    if (self->queue) {
+        for (p = self->queue; p && (iovc < 64); p = p->next, iovc++) {
+            iov[iovc].iov_base = p->payload;
+            iov[iovc].iov_len = p->len;
+        }
+    } else if (self->pcb_eof) {
+        res = -1;
+    } else {
+        res = 0;
     }
 
-    s = writev (HEV_SOCKS5 (self)->fd, iov, i);
-    if (0 >= s) {
-        if ((0 > s) && (EAGAIN == errno))
-            return 0;
-        return -1;
+    if (iovc) {
+        ssize_t s = writev (HEV_SOCKS5 (self)->fd, iov, iovc);
+        if (0 >= s) {
+            if ((0 > s) && (EAGAIN == errno))
+                res = 0;
+            else
+                res = -1;
+        } else {
+            hev_task_mutex_lock (self->mutex);
+            self->queue = pbuf_free_header (self->queue, s);
+            if (self->pcb)
+                tcp_recved (self->pcb, s);
+            hev_task_mutex_unlock (self->mutex);
+            res = 1;
+        }
+    } else if (res < 0) {
+        shutdown (HEV_SOCKS5 (self)->fd, SHUT_WR);
     }
 
-    hev_task_mutex_lock (self->mutex);
-    self->queue = pbuf_free_header (self->queue, s);
-    if (self->pcb)
-        tcp_recved (self->pcb, s);
-    hev_task_mutex_unlock (self->mutex);
-    if (!self->queue)
-        return 0;
-
-    return 1;
+    return res;
 }
 
 static int
@@ -65,37 +87,45 @@ tcp_splice_b (HevSocks5SessionTCP *self)
 {
     struct iovec iov[2];
     err_t err = ERR_OK;
-    int iovlen;
-    ssize_t s;
+    int res = 1, iovc;
 
-    iovlen = hev_ring_buffer_writing (self->buffer, iov);
-    if (iovlen <= 0)
-        return 0;
-
-    s = readv (HEV_SOCKS5 (self)->fd, iov, iovlen);
-    if (0 >= s) {
-        if ((0 > s) && (EAGAIN == errno))
-            return 0;
-        return -1;
+    iovc = hev_ring_buffer_writing (self->buffer, iov);
+    if (iovc) {
+        ssize_t s = readv (HEV_SOCKS5 (self)->fd, iov, iovc);
+        if (0 >= s) {
+            if ((0 > s) && (EAGAIN == errno))
+                res = 0;
+            else
+                res = -1;
+        } else {
+            hev_ring_buffer_write_finish (self->buffer, s);
+        }
     }
-    hev_ring_buffer_write_finish (self->buffer, s);
 
     hev_task_mutex_lock (self->mutex);
     if (self->pcb) {
-        int i;
-        iovlen = hev_ring_buffer_reading (self->buffer, iov);
-        for (i = 0, s = 0; i < iovlen; i++) {
-            err |= tcp_write (self->pcb, iov[i].iov_base, iov[i].iov_len, 0);
-            s += iov[i].iov_len;
+        iovc = hev_ring_buffer_reading (self->buffer, iov);
+        if (iovc) {
+            ssize_t s = 0;
+            int i;
+            for (i = 0; i < iovc; i++) {
+                void *ptr = iov[i].iov_base;
+                size_t len = iov[i].iov_len;
+                err |= tcp_write (self->pcb, ptr, len, 0);
+                s += len;
+            }
+            hev_ring_buffer_read_finish (self->buffer, s);
+            err |= tcp_output (self->pcb);
+            res = 1;
+        } else if (res < 0) {
+            tcp_shutdown (self->pcb, 0, 1);
         }
-        hev_ring_buffer_read_finish (self->buffer, s);
-        err |= tcp_output (self->pcb);
     }
     hev_task_mutex_unlock (self->mutex);
     if (!self->pcb || (err != ERR_OK))
-        return -1;
+        res = -1;
 
-    return 1;
+    return res;
 }
 
 static err_t
@@ -103,17 +133,16 @@ tcp_recv_handler (void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
 {
     HevSocks5SessionTCP *self = arg;
 
-    if (!p) {
-        hev_socks5_session_terminate (HEV_SOCKS5_SESSION (self));
-        return ERR_OK;
-    }
-
-    if (!self->queue) {
-        self->queue = p;
+    if (p) {
+        if (!self->queue) {
+            self->queue = p;
+        } else {
+            if (self->queue->tot_len > TCP_WND_MAX (pcb))
+                return ERR_WOULDBLOCK;
+            pbuf_cat (self->queue, p);
+        }
     } else {
-        if (self->queue->tot_len > TCP_WND_MAX (pcb))
-            return ERR_WOULDBLOCK;
-        pbuf_cat (self->queue, p);
+        self->pcb_eof = 1;
     }
 
     hev_task_wakeup (self->data.task);
@@ -161,10 +190,34 @@ hev_socks5_session_tcp_new (struct tcp_pcb *pcb, HevTaskMutex *mutex)
     return self;
 }
 
+static int
+hev_socks5_session_tcp_bind (HevSocks5 *self, int fd,
+                             const struct sockaddr *dest)
+{
+    HevConfigServer *srv;
+    unsigned int mark;
+
+    LOG_D ("%p socks5 session tcp bind", self);
+
+    srv = hev_config_get_socks5_server ();
+    mark = srv->mark;
+
+    if (mark) {
+        int res;
+
+        res = set_sock_mark (fd, mark);
+        if (res < 0)
+            return -1;
+    }
+
+    return 0;
+}
+
 static void
 hev_socks5_session_tcp_splice (HevSocks5Session *base)
 {
     HevSocks5SessionTCP *self = HEV_SOCKS5_SESSION_TCP (base);
+    int tcp_buffer_size;
     int res_f = 1;
     int res_b = 1;
 
@@ -173,7 +226,8 @@ hev_socks5_session_tcp_splice (HevSocks5Session *base)
     if (!self->pcb)
         return;
 
-    self->buffer = hev_ring_buffer_new (tcp_sndbuf (self->pcb));
+    tcp_buffer_size = hev_config_get_misc_tcp_buffer_size ();
+    self->buffer = hev_ring_buffer_alloca (tcp_buffer_size);
     if (!self->buffer)
         return;
 
@@ -185,14 +239,22 @@ hev_socks5_session_tcp_splice (HevSocks5Session *base)
         if (res_b >= 0)
             res_b = tcp_splice_b (self);
 
-        if (res_f < 0 || res_b < 0)
-            break;
-        else if (res_f > 0 || res_b > 0)
+        if (res_f > 0 || res_b > 0)
             type = HEV_TASK_YIELD;
-        else
+        else if ((res_f & res_b) == 0)
             type = HEV_TASK_WAITIO;
+        else
+            break;
 
         if (task_io_yielder (type, base) < 0)
+            break;
+    }
+
+    while (self->pcb) {
+        if (hev_ring_buffer_get_use_size (self->buffer) == 0)
+            break;
+
+        if (task_io_yielder (HEV_TASK_WAITIO, base) < 0)
             break;
     }
 }
@@ -225,29 +287,14 @@ int
 hev_socks5_session_tcp_construct (HevSocks5SessionTCP *self,
                                   struct tcp_pcb *pcb, HevTaskMutex *mutex)
 {
-    struct sockaddr_in6 ad6;
-    struct sockaddr_in ad4;
-    struct sockaddr *addr;
+    HevSocks5Addr addr;
     int res;
 
-    switch (pcb->local_ip.type) {
-    case IPADDR_TYPE_V4:
-        ad4.sin_family = AF_INET;
-        ad4.sin_port = htons (pcb->local_port);
-        memcpy (&ad4.sin_addr, &pcb->local_ip, 4);
-        addr = (struct sockaddr *)&ad4;
-        break;
-    case IPADDR_TYPE_V6:
-        ad6.sin6_family = AF_INET6;
-        ad6.sin6_port = htons (pcb->local_port);
-        memcpy (&ad6.sin6_addr, &pcb->local_ip, 16);
-        addr = (struct sockaddr *)&ad6;
-        break;
-    default:
+    res = hev_socks5_addr_from_lwip (&addr, &pcb->local_ip, pcb->local_port);
+    if (res < 0)
         return -1;
-    }
 
-    res = hev_socks5_client_tcp_construct_ip (&self->base, addr);
+    res = hev_socks5_client_tcp_construct (&self->base, &addr);
     if (res < 0)
         return -1;
 
@@ -279,19 +326,14 @@ hev_socks5_session_tcp_destruct (HevObject *base)
         tcp_recv (self->pcb, NULL);
         tcp_sent (self->pcb, NULL);
         tcp_err (self->pcb, NULL);
-
-        if (tcp_close (self->pcb) != ERR_OK)
-            tcp_abort (self->pcb);
+        tcp_abort (self->pcb);
     }
 
     if (self->queue)
         pbuf_free (self->queue);
     hev_task_mutex_unlock (self->mutex);
 
-    if (self->buffer)
-        hev_ring_buffer_destroy (self->buffer);
-
-    HEV_SOCKS5_CLIENT_TCP_TYPE->finalizer (base);
+    HEV_SOCKS5_CLIENT_TCP_TYPE->destruct (base);
 }
 
 static void *
@@ -313,6 +355,7 @@ hev_socks5_session_tcp_class (void)
     HevObjectClass *okptr = HEV_OBJECT_CLASS (kptr);
 
     if (!okptr->name) {
+        HevSocks5Class *skptr;
         HevSocks5SessionIface *siptr;
         void *ptr;
 
@@ -320,8 +363,11 @@ hev_socks5_session_tcp_class (void)
         memcpy (kptr, ptr, sizeof (HevSocks5ClientTCPClass));
 
         okptr->name = "HevSocks5SessionTCP";
-        okptr->finalizer = hev_socks5_session_tcp_destruct;
+        okptr->destruct = hev_socks5_session_tcp_destruct;
         okptr->iface = hev_socks5_session_tcp_iface;
+
+        skptr = HEV_SOCKS5_CLASS (kptr);
+        skptr->binder = hev_socks5_session_tcp_bind;
 
         siptr = &kptr->session;
         siptr->splicer = hev_socks5_session_tcp_splice;

@@ -11,7 +11,6 @@
 
 #include "hev-logger.h"
 #include "hev-config.h"
-
 #include "hev-socks5-client.h"
 
 #include "hev-socks5-session.h"
@@ -42,15 +41,17 @@ hev_socks5_session_run (HevSocks5Session *self)
 
     hev_socks5_set_timeout (HEV_SOCKS5 (self), read_write_timeout);
 
-    if (srv->user && srv->pass && srv->auth_key) {
-        hev_socks5_set_auth_user_pass_auth_key (HEV_SOCKS5 (self), srv->user, srv->pass,srv->auth_key);
-        LOG_D ("%p socks5 client auth %s:%s:%s", self, srv->user, srv->pass, srv->auth_key);
-    } else if (srv->user && srv->pass) {
-        hev_socks5_set_auth_user_pass (HEV_SOCKS5 (self), srv->user, srv->pass);
-        LOG_D ("%p socks5 client auth %s:%s", self, srv->user, srv->pass);
+    if (srv->user && srv->pass) {
+        hev_socks5_client_set_auth (HEV_SOCKS5_CLIENT (self), srv->user,
+                                    srv->pass, srv->auth_key);
+        if (srv->auth_key) {
+            LOG_D ("%p socks5 client auth %s:%s:%s", self, srv->user, srv->pass, srv->auth_key);
+        } else {
+            LOG_D ("%p socks5 client auth %s:%s", self, srv->user, srv->pass);
+        }
     }
 
-    res = hev_socks5_client_handshake (HEV_SOCKS5_CLIENT (self));
+    res = hev_socks5_client_handshake (HEV_SOCKS5_CLIENT (self), srv->pipeline);
     if (res < 0) {
         LOG_E ("%p socks5 session handshake", self);
         return;
